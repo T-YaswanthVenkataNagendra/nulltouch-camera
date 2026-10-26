@@ -1,0 +1,261 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NullTouch Camera</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 700px;
+      margin: 20px auto;
+      padding: 16px;
+      background: #101827;
+      color: white;
+      text-align: center;
+    }
+    button {
+      padding: 12px 18px;
+      margin: 6px;
+      border: 0;
+      border-radius: 10px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    video {
+      width: 100%;
+      max-width: 480px;
+      border-radius: 14px;
+      transform: scaleX(-1);
+    }
+    #status, #gesture {
+      padding: 12px;
+      margin: 10px 0;
+      background: #233047;
+      border-radius: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>NullTouch</h1>
+  <p>Camera hand recognition + ESP32 BLE</p>
+
+  <button id="connect">Connect ESP32</button>
+  <button id="start">Start Camera</button>
+
+  <div id="status">ESP32 not connected</div>
+  <div id="gesture">Gesture: none</div>
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="work" hidden></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+  <script>
+    const SERVICE_UUID =
+      "12345678-1234-1234-1234-123456789000";
+    const CHAR_UUID =
+      "12345678-1234-1234-1234-123456789001";
+
+    const statusBox = document.getElementById("status");
+    const gestureBox = document.getElementById("gesture");
+    const video = document.getElementById("camera");
+    const canvas = document.getElementById("work");
+    const ctx = canvas.getContext("2d");
+
+    let characteristic = null;
+    let hands = null;
+    let cameraStream = null;
+    let lastSent = "";
+    let lastSentAt = 0;
+    let previousX = null;
+    let previousY = null;
+    let previousMoveAt = 0;
+    let stableGesture = "";
+    let stableCount = 0;
+    let busy = false;
+
+    document.getElementById("connect").onclick = async () => {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: "NullTouch" }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        characteristic =
+          await service.getCharacteristic(CHAR_UUID);
+
+        statusBox.textContent = "Connected to NullTouch!";
+      } catch (e) {
+        statusBox.textContent = "Bluetooth error: " + e.message;
+      }
+    };
+
+    async function sendCommand(command) {
+      if (!characteristic) return;
+
+      const now = Date.now();
+      if (command === lastSent && now - lastSentAt < 1500) return;
+      if (now - lastSentAt < 700) return;
+
+      try {
+        await characteristic.writeValueWithResponse(
+          new TextEncoder().encode(command)
+        );
+        lastSent = command;
+        lastSentAt = now;
+        statusBox.textContent = "ESP32 command sent: " + command;
+      } catch (e) {
+        statusBox.textContent = "BLE write failed: " + e.message;
+      }
+    }
+
+    // MediaPipe landmark indices:
+    // wrist 0; thumb tip 4; index tip 8; middle tip 12;
+    // ring tip 16; little finger tip 20.
+    function classify(lm) {
+      const tips = [8, 12, 16, 20];
+      const bases = [5, 9, 13, 17];
+
+      let extended = 0;
+      for (let i = 0; i < tips.length; i++) {
+        if (lm[tips[i]].y < lm[bases[i]].y - 0.035) {
+          extended++;
+        }
+      }
+
+      const thumbOut =
+        Math.abs(lm[4].x - lm[2].x) > 0.07;
+
+      if (extended >= 4 && thumbOut) return "OPEN_PALM";
+      if (extended === 0) return "FIST";
+
+      if (extended === 1 && lm[8].y < lm[6].y) {
+        return "POINT";
+      }
+
+      return "UNKNOWN";
+    }
+
+    function movement(lm) {
+      const now = Date.now();
+      const x = lm[0].x;
+      const y = lm[0].y;
+      let command = "";
+
+      if (previousX !== null && now - previousMoveAt > 450) {
+        const dx = x - previousX;
+        const dy = y - previousY;
+
+        if (Math.abs(dx) > 0.16 && Math.abs(dx) > Math.abs(dy)) {
+          command = dx > 0 ? "SWIPE_LEFT" : "SWIPE_RIGHT";
+        } else if (Math.abs(dy) > 0.16 && Math.abs(dy) > Math.abs(dx)) {
+          command = dy > 0 ? "DOWN" : "UP";
+        }
+
+        if (command) {
+          previousMoveAt = now;
+          previousX = x;
+          previousY = y;
+          return command;
+        }
+      }
+
+      previousX = x;
+      previousY = y;
+      return "";
+    }
+
+    document.getElementById("start").onclick = async () => {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Open this page using HTTPS in Chrome.");
+        }
+
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false
+        });
+
+        video.srcObject = cameraStream;
+        await video.play();
+
+        hands = new Hands({
+          locateFile: file =>
+            "https://cdn.jsdelivr.net/npm/@mediapipe/hands/" + file
+        });
+
+        hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.65,
+          minTrackingConfidence: 0.65
+        });
+
+        hands.onResults(async results => {
+          if (busy) return;
+
+          const lm = results.multiHandLandmarks?.[0];
+          if (!lm) {
+            gestureBox.textContent = "Gesture: no hand detected";
+            stableGesture = "";
+            stableCount = 0;
+            previousX = previousY = null;
+            return;
+          }
+
+          const move = movement(lm);
+          const pose = classify(lm);
+          const label = move || pose;
+
+          gestureBox.textContent = "Gesture: " + label;
+
+          if (move) {
+            stableGesture = "";
+            stableCount = 0;
+            await sendCommand(move);
+            return;
+          }
+
+          if (pose === stableGesture) {
+            stableCount++;
+          } else {
+            stableGesture = pose;
+            stableCount = 1;
+          }
+
+          // Require a steady pose before sending a command.
+          if (stableCount >= 8 && pose !== "UNKNOWN") {
+            const command =
+              pose === "OPEN_PALM" ? "STOP" :
+              pose === "FIST" ? "BACK" :
+              pose === "POINT" ? "POINT" : "";
+
+            if (command) {
+              busy = true;
+              await sendCommand(command);
+              busy = false;
+              stableCount = 0;
+            }
+          }
+        });
+
+        async function frame() {
+          if (video.readyState >= 2 && hands) {
+            await hands.send({ image: video });
+          }
+          requestAnimationFrame(frame);
+        }
+
+        frame();
+        statusBox.textContent =
+          "Camera running. Connect ESP32 to send commands.";
+      } catch (e) {
+        statusBox.textContent = "Camera error: " + e.message;
+      }
+    };
+  </script>
+</body>
+</html>
